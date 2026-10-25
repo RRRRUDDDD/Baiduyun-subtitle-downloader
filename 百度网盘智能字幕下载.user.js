@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         百度网盘智能字幕下载
 // @namespace    http://github.com/lihaoze123/Baiduyun-subtitle-downloader
-// @version      0.5.0
-// @description  下载百度网盘视频的智能字幕（SRT），支持单个视频下载与整个文件夹批量提取
+// @version      0.7.0
+// @description  下载百度网盘视频的智能字幕（SRT），支持单个视频与文件夹批量提取，保存目录可自选
 // @match        *://pan.baidu.com/*
 // @grant        GM_download
 // @connect      baidupcs.com
@@ -19,8 +19,15 @@
     const CONCURRENCY = 3;
     const RESULT_DELAY = 400;
     const HOST_ID = 'bdy-subtitle-helper';
-    // 保存目录：相对于浏览器默认下载目录。留空则直接保存到下载目录根部。
+    const ENTRY_ID = 'bdy-subtitle-entry';
+    const ENTRY_WRAP_ID = 'bdy-subtitle-entry-wrap';
+    const FALLBACK_ID = 'bdy-subtitle-fallback';
+    // 未选择自定义文件夹时，保存到浏览器下载目录下的这个子目录。
     const SAVE_FOLDER = '百度网盘字幕';
+    const DB_NAME = 'bdy-subtitle-helper';
+    const DB_STORE = 'settings';
+    const DIR_KEY = 'custom-dir';
+    let customDir = null;
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -118,13 +125,82 @@
         return String(text || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/[.\s]+$/, '');
     }
 
+    function folderOfPath(path) {
+        return path.split('/').slice(-2, -1)[0] || '';
+    }
+
     function downloadName(subtitle, videoPath) {
-        const folder = sanitizeSegment(videoPath.split('/').slice(-2, -1)[0] || '');
-        const parts = [];
-        if (SAVE_FOLDER) parts.push(sanitizeSegment(SAVE_FOLDER));
-        if (folder) parts.push(folder);
-        parts.push(subtitle.fileName);
-        return parts.filter(Boolean).join('/');
+        const dir = [SAVE_FOLDER, sanitizeSegment(folderOfPath(videoPath))].filter(Boolean).join('/');
+        return [dir, subtitle.fileName].filter(Boolean).join('/');
+    }
+
+    function openDb() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(DB_NAME, 1);
+            req.onupgradeneeded = () => {
+                if (!req.result.objectStoreNames.contains(DB_STORE)) req.result.createObjectStore(DB_STORE);
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    function idbRequest(req) {
+        return new Promise((resolve, reject) => {
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function loadDirHandle() {
+        const db = await openDb();
+        try {
+            return await idbRequest(db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(DIR_KEY));
+        } finally {
+            db.close();
+        }
+    }
+
+    async function storeDirHandle(handle) {
+        const db = await openDb();
+        try {
+            await idbRequest(db.transaction(DB_STORE, 'readwrite').objectStore(DB_STORE).put(handle, DIR_KEY));
+        } finally {
+            db.close();
+        }
+    }
+
+    async function clearDirHandle() {
+        const db = await openDb();
+        try {
+            await idbRequest(db.transaction(DB_STORE, 'readwrite').objectStore(DB_STORE).delete(DIR_KEY));
+        } finally {
+            db.close();
+        }
+    }
+
+    async function writableCustomDir() {
+        if (!customDir) return null;
+        const opts = { mode: 'readwrite' };
+        let permission = await customDir.queryPermission(opts);
+        // 页面刷新后权限会退回 prompt，需要在用户点击动作里重新申请
+        if (permission !== 'granted' && typeof customDir.requestPermission === 'function') {
+            permission = await customDir.requestPermission(opts);
+        }
+        if (permission === 'granted') return customDir;
+        throw new Error('自定义文件夹没有写入权限，请重新选择文件夹');
+    }
+
+    async function saveToCustomDir(subtitle) {
+        const dir = await writableCustomDir();
+        const res = await fetch(subtitle.url, { credentials: 'omit' });
+        if (!res.ok) throw new Error(`字幕文件下载失败 (HTTP ${res.status})`);
+        const data = await res.arrayBuffer();
+        if (!data.byteLength) throw new Error('字幕内容为空');
+        const target = await dir.getFileHandle(subtitle.fileName, { create: true });
+        const writable = await target.createWritable();
+        await writable.write(data);
+        await writable.close();
     }
 
     function extractSubtitle(m3u8, videoPath) {
@@ -304,6 +380,10 @@
     }
 
     async function saveSubtitle(subtitle, videoPath) {
+        if (customDir) {
+            await saveToCustomDir(subtitle);
+            return;
+        }
         if (typeof GM_download === 'function') {
             try {
                 await gmDownload(subtitle.url, downloadName(subtitle, videoPath));
@@ -377,11 +457,15 @@
         host: null,
         root: null,
         panel: null,
-        pill: null,
+        fallbackBtn: null,
+        entryBtn: null,
+        anchorEl: null,
         ctxNameEl: null,
         ctxMetaEl: null,
         saveRow: null,
         savePathEl: null,
+        pickDirBtn: null,
+        resetDirBtn: null,
         actionBtn: null,
         actionLabel: null,
         cancelBtn: null,
@@ -404,11 +488,92 @@
     };
 
     let countCache = { dir: '', count: 0, time: 0 };
+    let entryTimer = 0;
+    let dirTouched = false;
 
     function saveHint(folderName) {
+        if (customDir) return `自定义文件夹：${customDir.name}/`;
         if (typeof GM_download !== 'function') return '未检测到 Tampermonkey，批量时将打包为 ZIP';
-        const folder = sanitizeSegment(folderName || '');
-        return `下载目录/${[SAVE_FOLDER, folder].filter(Boolean).join('/')}/`;
+        const dir = [SAVE_FOLDER, sanitizeSegment(folderName)].filter(Boolean).join('/');
+        return `下载目录/${dir}/`;
+    }
+
+    function currentFolderName() {
+        if (!ui.context) return '';
+        return ui.context.mode === 'video' ? folderOfPath(ui.context.path) : ui.context.name;
+    }
+
+    function updateSaveHint() {
+        if (!ui.savePathEl || !ui.context) return;
+        ui.savePathEl.textContent = saveHint(currentFolderName());
+        ui.saveRow.classList.toggle('warn', !customDir && typeof GM_download !== 'function');
+        ui.saveRow.title = customDir ? '出于隐私限制，网页只能获取文件夹名称' : '';
+        ui.pickDirBtn.textContent = customDir ? '更换文件夹' : '选择文件夹';
+        ui.resetDirBtn.classList.toggle('hidden', !customDir);
+        const supported = typeof window.showDirectoryPicker === 'function';
+        ui.pickDirBtn.disabled = ui.running || !supported;
+        ui.pickDirBtn.title = supported ? '' : '当前浏览器不支持选择文件夹';
+        ui.resetDirBtn.disabled = ui.running;
+    }
+
+    async function chooseCustomDir() {
+        if (ui.running) return;
+        if (typeof window.showDirectoryPicker !== 'function') {
+            setStatus('当前浏览器不支持选择文件夹，请使用 Chrome 或 Edge', 'err');
+            return;
+        }
+        let handle = null;
+        try {
+            handle = await window.showDirectoryPicker({ id: 'bdy-subtitle', mode: 'readwrite', startIn: 'downloads' });
+        } catch (err) {
+            if (!err || err.name !== 'AbortError') setStatus(`选择文件夹失败：${(err && err.message) || err}`, 'err');
+            return;
+        }
+        try {
+            if (await handle.queryPermission({ mode: 'readwrite' }) !== 'granted'
+                && await handle.requestPermission({ mode: 'readwrite' }) !== 'granted') {
+                setStatus('未获得文件夹写入权限', 'err');
+                return;
+            }
+        } catch (e) {
+            setStatus('未获得文件夹写入权限', 'err');
+            return;
+        }
+        dirTouched = true;
+        customDir = handle;
+        try {
+            await storeDirHandle(handle);
+        } catch (e) {
+            // 无法持久化时只对当前页面生效
+        }
+        updateSaveHint();
+        setStatus(`已选择文件夹：${handle.name}`, 'ok');
+    }
+
+    async function resetCustomDir() {
+        if (ui.running) return;
+        dirTouched = true;
+        customDir = null;
+        try {
+            await clearDirHandle();
+        } catch (e) {
+            // 忽略存储错误
+        }
+        updateSaveHint();
+        setStatus('已恢复默认保存位置', 'ok');
+    }
+
+    async function restoreCustomDir() {
+        if (typeof window.showDirectoryPicker !== 'function') return;
+        try {
+            const handle = await loadDirHandle();
+            if (dirTouched) return;
+            if (!handle || typeof handle.queryPermission !== 'function') return;
+            customDir = handle;
+            updateSaveHint();
+        } catch (e) {
+            // IndexedDB 不可用时保持默认
+        }
     }
 
     function setStatus(text, kind) {
@@ -484,7 +649,7 @@
         ui.actionLabel.textContent = ui.context.mode === 'video' ? '下载本视频字幕' : '批量下载字幕';
     }
 
-    function setRunning(running, mode) {
+    function setRunning(running) {
         ui.running = running;
         if (ui.actionBtn) {
             ui.actionBtn.disabled = running;
@@ -502,6 +667,7 @@
             restoreActionLabel();
         }
         updateToolbar();
+        updateSaveHint();
     }
 
     async function refreshFolderCount(force = false) {
@@ -526,16 +692,18 @@
 
     function refreshContext() {
         if (!ui.host) return;
+        const previous = ui.context;
         const context = getPageContext();
+        const changed = !previous || !context || previous.mode !== context.mode || previous.path !== context.path;
         ui.context = context;
+        if (changed) closePanel();
+        ensureEntryButton();
         if (!context) {
-            ui.host.style.display = 'none';
+            closePanel();
             return;
         }
         if (ui.running) return;
-        ui.host.style.display = 'block';
         ui.progressEl.classList.add('hidden');
-        ui.saveRow.classList.remove('warn');
         setStats({ ok: 0, noSubtitle: 0, failed: 0 }, false);
         ui.problems = [];
         clearLog();
@@ -543,24 +711,218 @@
         if (context.mode === 'video') {
             ui.ctxNameEl.textContent = context.name;
             ui.ctxMetaEl.textContent = '视频播放页';
-            ui.savePathEl.textContent = saveHint(context.path.split('/').slice(-2, -1)[0]);
-            ui.saveRow.classList.toggle('warn', typeof GM_download !== 'function');
             ui.actionLabel.textContent = '下载本视频字幕';
         } else {
             ui.ctxNameEl.textContent = context.name;
             ui.ctxMetaEl.textContent = '正在统计视频数量…';
-            ui.savePathEl.textContent = saveHint(context.name);
-            ui.saveRow.classList.toggle('warn', typeof GM_download !== 'function');
             ui.actionLabel.textContent = '批量下载字幕';
             if (!ui.panel.classList.contains('hidden')) refreshFolderCount();
         }
+        updateSaveHint();
         updateToolbar();
+    }
+
+    function closePanel() {
+        if (!ui.panel) return;
+        ui.panel.classList.add('hidden');
+        ui.anchorEl = null;
+    }
+
+    function positionPanel() {
+        if (!ui.anchorEl || !ui.panel || ui.panel.classList.contains('hidden')) return;
+        if (!ui.anchorEl.isConnected) {
+            closePanel();
+            return;
+        }
+        const rect = ui.anchorEl.getBoundingClientRect();
+        const width = ui.panel.offsetWidth;
+        const height = ui.panel.offsetHeight;
+        const margin = 8;
+        const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+        const left = Math.min(Math.max(margin, rect.right - width), maxLeft);
+        let top = rect.bottom + 8;
+        if (top + height > window.innerHeight - margin) top = rect.top - height - 8;
+        top = Math.max(margin, top);
+        ui.host.style.left = `${Math.round(left)}px`;
+        ui.host.style.top = `${Math.round(top)}px`;
+    }
+
+    function togglePanel(anchor) {
+        if (!ui.panel.classList.contains('hidden')) {
+            closePanel();
+            return;
+        }
+        ui.anchorEl = anchor || ui.entryBtn;
+        ui.panel.classList.remove('hidden');
+        positionPanel();
+        requestAnimationFrame(positionPanel);
+        if (ui.context && ui.context.mode === 'folder' && !ui.running) refreshFolderCount();
+    }
+
+    function entryIconHtml() {
+        return '<i class="bdy-sub-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 11h4M7 15h7M14 11h3"/></svg></i><span>字幕</span>';
+    }
+
+    function ensurePageStyles() {
+        if (document.getElementById('bdy-subtitle-style')) return;
+        const style = document.createElement('style');
+        style.id = 'bdy-subtitle-style';
+        style.textContent = `
+            #bdy-subtitle-entry { white-space: nowrap; }
+            #bdy-subtitle-entry .bdy-sub-icon {
+                display: inline-block;
+                width: 16px;
+                height: 16px;
+                margin-right: 6px;
+                vertical-align: -3px;
+                font-style: normal;
+            }
+            #bdy-subtitle-entry .bdy-sub-icon svg { display: block; width: 100%; height: 100%; }
+            #bdy-subtitle-entry.vp-toolsbar__tools-btn .bdy-sub-icon { width: 15px; height: 15px; vertical-align: -2px; }
+            #bdy-subtitle-fallback {
+                position: fixed;
+                right: 24px;
+                bottom: 24px;
+                z-index: 2147483646;
+                height: 34px;
+                padding: 0 18px;
+                border: none;
+                border-radius: 17px;
+                background: #06a7ff;
+                color: #fff;
+                font: 700 13px/1 SFUIText, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+                display: inline-flex;
+                align-items: center;
+                cursor: pointer;
+                box-shadow: 0 4px 16px rgba(6, 167, 255, .35);
+            }
+            #bdy-subtitle-fallback:hover { background: #0597e6; }
+            #bdy-subtitle-fallback.hidden { display: none; }
+            #bdy-subtitle-fallback .bdy-sub-icon {
+                display: inline-flex;
+                width: 16px;
+                height: 16px;
+                margin-right: 6px;
+                font-style: normal;
+            }
+            #bdy-subtitle-fallback .bdy-sub-icon svg { width: 100%; height: 100%; }
+        `;
+        document.head.appendChild(style);
+    }
+
+    function visibleElements(selector) {
+        return [...document.querySelectorAll(selector)].filter(el => {
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        });
+    }
+
+    function findNoteButton() {
+        return visibleElements('button[title="新建笔记"]')[0] || null;
+    }
+
+    function findVideoDownloadButton() {
+        return visibleElements('button.vp-toolsbar__tools-btn[title="下载"]')[0] || null;
+    }
+
+    function createEntryButton(mode, anchor) {
+        ensurePageStyles();
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.id = ENTRY_ID;
+        btn.className = anchor.className;
+        btn.title = '字幕';
+        const style = anchor.getAttribute('style');
+        if (style) btn.setAttribute('style', style);
+        btn.dataset.mode = mode;
+        btn.innerHTML = entryIconHtml();
+        btn.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            togglePanel(btn);
+        });
+        if (mode === 'folder') {
+            const action = anchor.closest('.wp-s-agile-tool-bar__h-action');
+            const wrap = document.createElement('div');
+            wrap.id = ENTRY_WRAP_ID;
+            wrap.className = action ? action.className : '';
+            wrap.appendChild(btn);
+            if (action && action.parentElement) action.after(wrap);
+            else anchor.after(wrap);
+        } else {
+            anchor.after(btn);
+        }
+        return btn;
+    }
+
+    function removeEntryButton() {
+        const wrap = document.getElementById(ENTRY_WRAP_ID);
+        if (wrap) wrap.remove();
+        const btn = document.getElementById(ENTRY_ID);
+        if (btn) btn.remove();
+        ui.entryBtn = null;
+    }
+
+    function showFallback() {
+        ensurePageStyles();
+        if (!ui.fallbackBtn) {
+            const btn = document.createElement('button');
+            btn.id = FALLBACK_ID;
+            btn.type = 'button';
+            btn.title = '下载字幕';
+            btn.innerHTML = entryIconHtml();
+            btn.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                togglePanel(btn);
+            });
+            document.body.appendChild(btn);
+            ui.fallbackBtn = btn;
+        }
+        ui.fallbackBtn.classList.remove('hidden');
+        ui.entryBtn = ui.fallbackBtn;
+    }
+
+    function hideFallback() {
+        if (ui.fallbackBtn) ui.fallbackBtn.classList.add('hidden');
+    }
+
+    function ensureEntryButton() {
+        if (!ui.host) return;
+        const mode = ui.context && ui.context.mode;
+        if (!mode) {
+            removeEntryButton();
+            hideFallback();
+            return;
+        }
+        const anchor = mode === 'folder' ? findNoteButton() : findVideoDownloadButton();
+        if (!anchor) {
+            removeEntryButton();
+            showFallback();
+            return;
+        }
+        hideFallback();
+        const existing = document.getElementById(ENTRY_ID);
+        if (existing && existing.isConnected && existing.dataset.mode === mode) {
+            ui.entryBtn = existing;
+            return;
+        }
+        removeEntryButton();
+        ui.entryBtn = createEntryButton(mode, anchor);
     }
 
     async function downloadCurrentVideo() {
         if (ui.running || !ui.context || ui.context.mode !== 'video') return;
         const context = ui.context;
-        setRunning(true, 'video');
+        if (customDir) {
+            try {
+                await writableCustomDir();
+            } catch (err) {
+                setStatus(err.message, 'err');
+                return;
+            }
+        }
+        setRunning(true);
         setStatus('正在获取字幕地址…');
         try {
             const subtitle = await getSubtitleForPath(context.path);
@@ -571,16 +933,28 @@
             setStatus(err.message, 'err');
             addLog(err.message, 'err');
         } finally {
-            setRunning(false, 'video');
+            setRunning(false);
         }
     }
 
     async function startBatch() {
         if (ui.running || !ui.context || ui.context.mode !== 'folder') return;
+        if (customDir) {
+            try {
+                await writableCustomDir();
+            } catch (err) {
+                setStatus(err.message, 'err');
+                return;
+            }
+        }
         const dir = ui.context.path;
-        const useZip = typeof GM_download !== 'function';
+        const useZip = !customDir && typeof GM_download !== 'function';
         const zipEntries = [];
         const save = async (subtitle, video) => {
+            if (customDir) {
+                await saveToCustomDir(subtitle);
+                return;
+            }
             if (!useZip) {
                 await saveSubtitle(subtitle, video.path);
                 return;
@@ -591,7 +965,7 @@
             if (!data.length) throw new Error('字幕内容为空');
             zipEntries.push({ name: subtitle.fileName, data });
         };
-        setRunning(true, 'batch');
+        setRunning(true);
         clearLog();
         ui.problems = [];
         setStats({ ok: 0, noSubtitle: 0, failed: 0 }, true);
@@ -651,8 +1025,7 @@
             setStatus(err.message, 'err');
             addLog(err.message, 'err');
         } finally {
-            setRunning(false, 'batch');
-            updateToolbar();
+            setRunning(false);
         }
     }
 
@@ -660,223 +1033,203 @@
         if (document.getElementById(HOST_ID)) return;
         const host = document.createElement('div');
         host.id = HOST_ID;
-        host.style.cssText = 'position:fixed;right:16px;bottom:88px;z-index:2147483647;';
+        host.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;';
         document.documentElement.appendChild(host);
         const root = host.attachShadow({ mode: 'open' });
         root.innerHTML = `
             <style>
                 :host { all: initial; }
                 * { box-sizing: border-box; }
-                .wrap {
-                    --bg: #ffffff;
-                    --text: #1f2329;
-                    --muted: #7c8698;
-                    --line: rgba(31, 35, 41, .09);
-                    --card: #f6f8fc;
-                    --accent: #2b7cff;
-                    --accent-2: #06a7ff;
+                .panel {
+                    width: 344px;
+                    max-width: calc(100vw - 24px);
+                    max-height: calc(100vh - 24px);
                     display: flex;
                     flex-direction: column;
-                    align-items: flex-end;
-                    gap: 10px;
-                    font-family: -apple-system, BlinkMacSystemFont, "Microsoft YaHei", "PingFang SC", sans-serif;
+                    background: #fff;
+                    border: 1px solid rgba(0, 0, 0, .05);
+                    border-radius: 12px;
+                    box-shadow: 0 8px 32px rgba(0, 0, 0, .14);
+                    font-family: SFUIText, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
                     font-size: 13px;
-                    color: var(--text);
                     line-height: 1.5;
-                }
-                .panel {
-                    width: 360px;
-                    max-width: calc(100vw - 32px);
-                    background: var(--bg);
-                    border: 1px solid var(--line);
-                    border-radius: 14px;
-                    box-shadow: 0 16px 48px rgba(20, 30, 50, .18), 0 2px 8px rgba(20, 30, 50, .08);
+                    color: #333;
                     overflow: hidden;
-                    transform-origin: bottom right;
-                    animation: pop .18s cubic-bezier(.2, .9, .3, 1.2);
-                }
-                @keyframes pop {
-                    from { opacity: 0; transform: translateY(6px) scale(.98); }
-                    to { opacity: 1; transform: none; }
+                    animation: bdy-pop .16s ease-out;
                 }
                 .panel.hidden { display: none; }
+                @keyframes bdy-pop {
+                    from { opacity: 0; transform: translateY(-4px); }
+                    to { opacity: 1; transform: none; }
+                }
                 .header {
                     display: flex;
                     align-items: center;
                     justify-content: space-between;
-                    padding: 12px 14px;
-                    border-bottom: 1px solid var(--line);
+                    padding: 13px 16px 10px;
                 }
-                .title {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    font-weight: 700;
-                    font-size: 13.5px;
-                    letter-spacing: .2px;
-                }
-                .logo {
+                .title { font-size: 15px; font-weight: 600; color: #1a1a1a; }
+                .close {
                     width: 24px;
                     height: 24px;
-                    border-radius: 7px;
-                    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-                    color: #fff;
+                    padding: 0;
+                    border: none;
+                    border-radius: 4px;
+                    background: transparent;
+                    color: #999;
+                    cursor: pointer;
                     display: grid;
                     place-items: center;
                 }
-                .logo svg { width: 14px; height: 14px; }
-                .close {
-                    border: none;
-                    background: transparent;
-                    font-size: 19px;
-                    line-height: 1;
-                    color: var(--muted);
-                    cursor: pointer;
-                    padding: 2px 4px;
-                    border-radius: 5px;
-                }
-                .close:hover { color: var(--text); background: var(--card); }
-                .body { padding: 12px 14px 14px; }
-                .context {
-                    background: var(--card);
-                    border-radius: 9px;
-                    padding: 9px 11px;
-                }
+                .close:hover { background: #f2f3f5; color: #666; }
+                .close svg { width: 14px; height: 14px; }
+                .body { padding: 0 16px 16px; overflow-y: auto; }
+                .body::-webkit-scrollbar { width: 6px; }
+                .body::-webkit-scrollbar-thumb { background: #dcdfe6; border-radius: 3px; }
+                .context { background: #f7f8fa; border-radius: 8px; padding: 10px 12px; }
                 .ctx-name {
-                    font-weight: 600;
                     font-size: 13px;
+                    font-weight: 600;
                     line-height: 1.45;
+                    color: #1a1a1a;
                     word-break: break-all;
                     display: -webkit-box;
                     -webkit-line-clamp: 2;
                     -webkit-box-orient: vertical;
                     overflow: hidden;
                 }
-                .ctx-meta {
-                    margin-top: 2px;
-                    color: var(--muted);
-                    font-size: 11.5px;
-                }
+                .ctx-meta { margin-top: 2px; color: #999; font-size: 12px; }
                 .save-row {
                     display: flex;
+                    align-items: center;
                     gap: 6px;
-                    align-items: flex-start;
-                    margin-top: 8px;
-                    color: var(--muted);
-                    font-size: 11.5px;
-                    line-height: 1.4;
+                    margin-top: 10px;
+                    color: #8c8c8c;
+                    font-size: 12px;
+                    line-height: 1.5;
                 }
-                .save-row svg {
-                    width: 12px;
-                    height: 12px;
+                .save-row .folder-icon {
+                    width: 13px;
+                    height: 13px;
                     flex: 0 0 auto;
-                    margin-top: 2px;
-                    opacity: .75;
+                    opacity: .7;
                 }
-                .save-path { word-break: break-all; }
-                .save-row.warn { color: #b26a00; }
-                .action {
-                    margin-top: 12px;
-                    width: 100%;
-                    height: 38px;
+                .save-path { flex: 1; word-break: break-all; }
+                .save-row.warn { color: #d97706; }
+                .save-actions { flex: 0 0 auto; display: flex; gap: 8px; margin-left: 2px; }
+                .save-actions button {
+                    padding: 0;
                     border: none;
-                    border-radius: 9px;
-                    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+                    background: none;
+                    color: #06a7ff;
+                    font: inherit;
+                    font-size: 12px;
+                    line-height: 1.5;
+                    cursor: pointer;
+                }
+                .save-actions button:hover:not(:disabled) { color: #0597e6; }
+                .save-actions button.hidden { display: none; }
+                .save-actions button:disabled { color: #c0c4cc; cursor: default; }
+                .save-actions .reset-dir { color: #8c8c8c; }
+                .save-actions .reset-dir:hover:not(:disabled) { color: #666; }
+                .action {
+                    margin-top: 14px;
+                    width: 100%;
+                    height: 34px;
+                    padding: 0;
+                    border: none;
+                    border-radius: 17px;
+                    background: #06a7ff;
                     color: #fff;
+                    font: inherit;
                     font-size: 13px;
-                    font-weight: 600;
+                    font-weight: 700;
                     cursor: pointer;
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     gap: 8px;
-                    box-shadow: 0 6px 16px rgba(43, 124, 255, .28);
-                    transition: filter .15s, transform .15s;
+                    transition: background .15s;
                 }
-                .action:hover:not(:disabled) { filter: brightness(1.05); }
-                .action:active:not(:disabled) { transform: translateY(1px); }
-                .action:disabled { cursor: default; filter: saturate(.75); opacity: .82; }
+                .action:hover:not(:disabled) { background: #0597e6; }
+                .action:disabled { opacity: .65; cursor: default; }
                 .spinner {
                     display: none;
                     width: 12px;
                     height: 12px;
                     border-radius: 50%;
-                    border: 2px solid rgba(255, 255, 255, .4);
+                    border: 2px solid rgba(255, 255, 255, .45);
                     border-top-color: #fff;
-                    animation: spin .7s linear infinite;
+                    animation: bdy-spin .7s linear infinite;
                 }
                 .action.loading .spinner { display: inline-block; }
-                @keyframes spin { to { transform: rotate(360deg); } }
-                .stats { display: flex; gap: 8px; margin-top: 10px; }
+                @keyframes bdy-spin { to { transform: rotate(360deg); } }
+                .stats { display: flex; gap: 8px; margin-top: 12px; }
                 .stats.hidden { display: none; }
                 .stat {
                     flex: 1;
-                    background: var(--card);
+                    padding: 7px 6px;
                     border-radius: 8px;
-                    padding: 6px 8px;
+                    background: #f7f8fa;
                     text-align: center;
                 }
-                .stat b { display: block; font-size: 15px; font-weight: 700; line-height: 1.25; }
-                .stat em { font-style: normal; font-size: 10.5px; color: var(--muted); }
-                .stat.ok b { color: #1a9b52; }
-                .stat.warn b { color: #c47f00; }
-                .stat.err b { color: #d93026; }
-                .progress { margin-top: 10px; }
+                .stat b { display: block; font-size: 15px; line-height: 1.3; }
+                .stat em { font-style: normal; font-size: 11px; color: #999; }
+                .stat.ok b { color: #21a675; }
+                .stat.warn b { color: #ff8800; }
+                .stat.err b { color: #f5222d; }
+                .progress { margin-top: 12px; }
                 .progress.hidden { display: none; }
-                .bar {
-                    height: 5px;
-                    border-radius: 999px;
-                    background: var(--line);
-                    overflow: hidden;
-                }
+                .bar { height: 4px; border-radius: 2px; background: #eef0f4; overflow: hidden; }
                 .bar > i {
                     display: block;
                     height: 100%;
                     width: 0;
-                    border-radius: 999px;
-                    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+                    background: #06a7ff;
                     transition: width .2s ease;
                 }
-                .progress-text { margin-top: 5px; color: var(--muted); font-size: 11.5px; }
+                .progress-text { margin-top: 6px; color: #999; font-size: 11px; }
                 .status {
-                    margin-top: 9px;
-                    min-height: 17px;
-                    color: var(--muted);
+                    margin-top: 10px;
+                    min-height: 18px;
+                    color: #8c8c8c;
                     font-size: 12px;
                     word-break: break-all;
                 }
-                .status[data-kind="ok"] { color: #1a9b52; }
-                .status[data-kind="warn"] { color: #b26a00; }
-                .status[data-kind="err"] { color: #d93026; }
-                .toolbar { display: flex; gap: 8px; margin-top: 9px; }
+                .status[data-kind="ok"] { color: #21a675; }
+                .status[data-kind="warn"] { color: #d97706; }
+                .status[data-kind="err"] { color: #f5222d; }
+                .toolbar { display: flex; gap: 14px; margin-top: 8px; }
                 .toolbar.hidden { display: none; }
                 .toolbar button {
-                    border: 1px solid var(--line);
-                    background: var(--bg);
-                    color: var(--muted);
-                    border-radius: 7px;
-                    padding: 5px 10px;
-                    font-size: 11.5px;
+                    padding: 0;
+                    border: none;
+                    background: none;
+                    color: #06a7ff;
+                    font: inherit;
+                    font-size: 12px;
                     cursor: pointer;
                 }
-                .toolbar button:hover:not(:disabled) { color: var(--text); border-color: rgba(31, 35, 41, .2); }
+                .toolbar button:hover:not(:disabled) { color: #0597e6; }
                 .toolbar button.hidden { display: none; }
+                .toolbar button:disabled { color: #c0c4cc; cursor: default; }
                 .log {
-                    margin-top: 10px;
-                    max-height: 132px;
+                    margin-top: 12px;
+                    max-height: 128px;
                     overflow-y: auto;
-                    background: var(--card);
+                    padding: 6px 10px;
                     border-radius: 8px;
-                    padding: 6px 8px;
+                    background: #f7f8fa;
                 }
                 .log:empty { display: none; }
                 .log::-webkit-scrollbar { width: 6px; }
-                .log::-webkit-scrollbar-thumb { background: rgba(127, 140, 160, .35); border-radius: 3px; }
+                .log::-webkit-scrollbar-thumb { background: #dcdfe6; border-radius: 3px; }
                 .log-item {
                     position: relative;
-                    padding: 2px 0 2px 12px;
-                    font-size: 11.5px;
-                    color: var(--muted);
+                    padding: 2px 0 2px 10px;
+                    font-size: 12px;
+                    line-height: 1.5;
+                    color: #8c8c8c;
                     white-space: nowrap;
                     overflow: hidden;
                     text-overflow: ellipsis;
@@ -884,103 +1237,69 @@
                 .log-item::before {
                     content: "";
                     position: absolute;
-                    left: 2px;
-                    top: 8px;
+                    left: 0;
+                    top: 9px;
                     width: 4px;
                     height: 4px;
                     border-radius: 50%;
                     background: currentColor;
-                    opacity: .6;
+                    opacity: .5;
                 }
-                .log-item.ok { color: #1a9b52; }
-                .log-item.warn { color: #c47f00; }
-                .log-item.err { color: #d93026; }
-                .pill {
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 7px;
-                    height: 40px;
-                    padding: 0 16px 0 13px;
-                    border: none;
-                    border-radius: 999px;
-                    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-                    color: #fff;
-                    font-size: 13px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    box-shadow: 0 8px 22px rgba(43, 124, 255, .34);
-                    transition: transform .15s, box-shadow .15s;
-                }
-                .pill svg { width: 16px; height: 16px; }
-                .pill:hover { transform: translateY(-1px); box-shadow: 0 10px 26px rgba(43, 124, 255, .42); }
-                .pill:active { transform: translateY(0); }
-                @media (prefers-color-scheme: dark) {
-                    .wrap {
-                        --bg: #1e2127;
-                        --text: #e8eaed;
-                        --muted: #9aa1ad;
-                        --line: rgba(255, 255, 255, .1);
-                        --card: #272b33;
-                    }
-                    .panel { box-shadow: 0 16px 48px rgba(0, 0, 0, .5), 0 0 0 1px rgba(255, 255, 255, .04); }
-                    .toolbar button:hover:not(:disabled) { border-color: rgba(255, 255, 255, .25); }
-                }
+                .log-item.ok { color: #21a675; }
+                .log-item.warn { color: #d97706; }
+                .log-item.err { color: #f5222d; }
             </style>
-            <div class="wrap">
-                <div class="panel hidden">
-                    <div class="header">
-                        <div class="title">
-                            <span class="logo">
-                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 11h4M7 15h7M14 11h3"/></svg>
-                            </span>
-                            <span>智能字幕</span>
-                        </div>
-                        <button class="close" type="button" title="收起">×</button>
-                    </div>
-                    <div class="body">
-                        <div class="context">
-                            <div class="ctx-name"></div>
-                            <div class="ctx-meta"></div>
-                        </div>
-                        <div class="save-row">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
-                            <span class="save-path"></span>
-                        </div>
-                        <button class="action" type="button">
-                            <span class="spinner"></span>
-                            <span class="action-label">下载本视频字幕</span>
-                        </button>
-                        <div class="stats hidden">
-                            <span class="stat ok"><b>0</b><em>成功</em></span>
-                            <span class="stat warn"><b>0</b><em>无字幕</em></span>
-                            <span class="stat err"><b>0</b><em>失败</em></span>
-                        </div>
-                        <div class="progress hidden">
-                            <div class="bar"><i></i></div>
-                            <div class="progress-text"></div>
-                        </div>
-                        <div class="status"></div>
-                        <div class="toolbar hidden">
-                            <button class="cancel hidden" type="button">取消</button>
-                            <button class="copy hidden" type="button">复制问题项</button>
-                        </div>
-                        <div class="log"></div>
-                    </div>
+            <div class="panel hidden" role="dialog" aria-label="字幕下载">
+                <div class="header">
+                    <span class="title">字幕下载</span>
+                    <button class="close" type="button" title="关闭">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+                    </button>
                 </div>
-                <button class="pill" type="button">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 11h4M7 15h7M14 11h3"/></svg>
-                    <span>字幕</span>
-                </button>
+                <div class="body">
+                    <div class="context">
+                        <div class="ctx-name"></div>
+                        <div class="ctx-meta"></div>
+                    </div>
+                    <div class="save-row">
+                        <svg class="folder-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+                        <span class="save-path"></span>
+                        <span class="save-actions">
+                            <button class="pick-dir" type="button">选择文件夹</button>
+                            <button class="reset-dir hidden" type="button">恢复默认</button>
+                        </span>
+                    </div>
+                    <button class="action" type="button">
+                        <span class="spinner"></span>
+                        <span class="action-label">下载本视频字幕</span>
+                    </button>
+                    <div class="stats hidden">
+                        <span class="stat ok"><b>0</b><em>成功</em></span>
+                        <span class="stat warn"><b>0</b><em>无字幕</em></span>
+                        <span class="stat err"><b>0</b><em>失败</em></span>
+                    </div>
+                    <div class="progress hidden">
+                        <div class="bar"><i></i></div>
+                        <div class="progress-text"></div>
+                    </div>
+                    <div class="status"></div>
+                    <div class="toolbar hidden">
+                        <button class="cancel hidden" type="button">取消</button>
+                        <button class="copy hidden" type="button">复制问题项</button>
+                    </div>
+                    <div class="log"></div>
+                </div>
             </div>
         `;
         ui.host = host;
         ui.root = root;
         ui.panel = root.querySelector('.panel');
-        ui.pill = root.querySelector('.pill');
         ui.ctxNameEl = root.querySelector('.ctx-name');
         ui.ctxMetaEl = root.querySelector('.ctx-meta');
         ui.saveRow = root.querySelector('.save-row');
         ui.savePathEl = root.querySelector('.save-path');
+        ui.pickDirBtn = root.querySelector('.pick-dir');
+        ui.resetDirBtn = root.querySelector('.reset-dir');
         ui.actionBtn = root.querySelector('.action');
         ui.actionLabel = root.querySelector('.action-label');
         ui.cancelBtn = root.querySelector('.cancel');
@@ -996,16 +1315,7 @@
         ui.progressText = root.querySelector('.progress-text');
         ui.logEl = root.querySelector('.log');
 
-        ui.pill.addEventListener('click', () => {
-            const opening = ui.panel.classList.contains('hidden');
-            ui.panel.classList.toggle('hidden');
-            if (opening && ui.context && ui.context.mode === 'folder' && !ui.running) {
-                refreshFolderCount();
-            }
-        });
-        root.querySelector('.close').addEventListener('click', () => {
-            ui.panel.classList.add('hidden');
-        });
+        root.querySelector('.close').addEventListener('click', closePanel);
         ui.actionBtn.addEventListener('click', () => {
             if (!ui.context || ui.running) return;
             if (ui.context.mode === 'video') downloadCurrentVideo();
@@ -1018,21 +1328,46 @@
             setStatus('正在取消，等待当前任务结束…', 'warn');
         });
         ui.copyBtn.addEventListener('click', copyProblems);
-        document.addEventListener('keydown', event => {
-            if (event.key === 'Escape') ui.panel.classList.add('hidden');
+        ui.pickDirBtn.addEventListener('click', chooseCustomDir);
+        ui.resetDirBtn.addEventListener('click', resetCustomDir);
+
+        const resizeObserver = new ResizeObserver(() => {
+            if (!ui.panel.classList.contains('hidden')) positionPanel();
         });
+        resizeObserver.observe(ui.panel);
     }
 
     mountUI();
     refreshContext();
+    restoreCustomDir();
+
     window.addEventListener('hashchange', refreshContext);
     window.addEventListener('popstate', refreshContext);
+    window.addEventListener('resize', positionPanel);
+    window.addEventListener('scroll', positionPanel, true);
 
-    // 文件列表是 SPA，切换目录后按钮文案与统计需要跟随更新
+    document.addEventListener('click', event => {
+        if (ui.panel.classList.contains('hidden')) return;
+        const path = event.composedPath ? event.composedPath() : [];
+        if (path.includes(ui.host) || path.includes(ui.entryBtn) || path.includes(ui.fallbackBtn)) return;
+        closePanel();
+    });
+
+    document.addEventListener('keydown', event => {
+        if (event.key === 'Escape') closePanel();
+    });
+
+    new MutationObserver(() => {
+        clearTimeout(entryTimer);
+        entryTimer = setTimeout(ensureEntryButton, 200);
+    }).observe(document.body, { childList: true, subtree: true });
+
+    // 文件列表是 SPA，切换目录后入口、文案与统计需要跟随更新
     setInterval(() => {
-        if (!ui.host || ui.running) return;
+        if (!ui.host) return;
         const next = getPageContext();
         const changed = (!next && ui.context) || (next && (!ui.context || next.mode !== ui.context.mode || next.path !== ui.context.path));
         if (changed) refreshContext();
+        else if (!ui.running) ensureEntryButton();
     }, 1500);
 })();

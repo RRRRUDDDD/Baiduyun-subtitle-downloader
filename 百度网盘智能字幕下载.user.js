@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         百度网盘智能字幕下载
 // @namespace    http://github.com/lihaoze123/Baiduyun-subtitle-downloader
-// @version      0.9.0
+// @version      0.9.1
 // @description  下载百度网盘视频的智能字幕，并导出文稿、课件和笔记，支持单个视频与文件夹批量处理
 // @match        *://pan.baidu.com/*
 // @grant        GM_download
@@ -848,10 +848,12 @@
         return ext ? `image/${ext.toLowerCase()}` : 'image/jpeg';
     }
 
-    async function inlineNoteImages(markdown, editor) {
-        const urls = [...new Set([...editor.querySelectorAll('img')]
-            .map(img => img.getAttribute('src'))
-            .filter(url => url && /^https?:/i.test(url)))];
+    function noteImageUrls(markdown) {
+        return [...new Set([...String(markdown).matchAll(/!\[[^\]]*\]\((https?:[^)\s]+)\)/g)]
+            .map(match => match[1]))];
+    }
+
+    async function inlineNoteImages(markdown, urls) {
         const queue = urls.slice();
         const worker = async () => {
             while (queue.length) {
@@ -869,9 +871,80 @@
         return markdown;
     }
 
+    function formatNoteTimestamp(ms) {
+        const total = Math.max(0, Math.floor(Number(ms) / 1000));
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const seconds = total % 60;
+        const mm = String(minutes).padStart(2, '0');
+        const ss = String(seconds).padStart(2, '0');
+        return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+    }
+
+    function taskNoteToMarkdown(content, title) {
+        let text = String(content || '').replace(/\r\n?/g, '\n');
+        text = text.replace(/[ \t]*<timestamp>\s*(\d+)\s*<\/timestamp>/g, (match, ms) => ` ${formatNoteTimestamp(ms)}`);
+        text = text.replace(/^(#{1,6}) /gm, (match, hashes) => `${'#'.repeat(Math.max(2, hashes.length - 2))} `);
+        text = text.replace(/<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi, (match, src) => `![课件截图](${src})`);
+        text = text.replace(/\n{3,}/g, '\n\n').trim();
+        return [`# ${title}`, text].filter(Boolean).join('\n\n');
+    }
+
+    async function noteTaskRequest(path, params, method = 'GET') {
+        const query = new URLSearchParams({
+            ...params,
+            clienttype: '0',
+            app_id: '250528',
+            web: '1',
+            channel: 'chunlei',
+        });
+        const res = await fetchWithTimeout(`${API_BASE}${path}?${query}`, {
+            method,
+            credentials: 'include',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        }, 30000);
+        const text = await res.text();
+        let json;
+        try {
+            json = JSON.parse(text);
+        } catch (err) {
+            throw new Error(`笔记接口返回异常 (HTTP ${res.status})`);
+        }
+        if (json.errno !== 0) throw new Error(json.show_msg || `笔记接口返回错误 (${json.errno})`);
+        return json.data || {};
+    }
+
+    async function generateNoteMarkdown(video) {
+        const fsid = String(video.fs_id);
+        const created = await noteTaskRequest('/ainote/tpl/taskcreate', { fsid, tpl_no: '3' }, 'POST');
+        let status = Number(created.status);
+        let taskKey = created.task_key || '';
+        let page = Number(created.page_num) || 1;
+        if (!taskKey) throw new Error('笔记任务创建失败');
+        const started = Date.now();
+        while (status !== 300) {
+            if (status !== 200) throw new Error(`笔记生成失败 (${status})`);
+            if (ui.cancelRequested) throw skipError('已取消');
+            if (Date.now() - started > 6 * 60 * 1000) throw skipError('笔记生成超时');
+            await sleep(5000);
+            const result = await noteTaskRequest('/ainote/tpl/taskquery', { task_key: taskKey, fsid });
+            status = Number(result.status);
+            if (result.page_num) page = Number(result.page_num);
+        }
+        const detail = await noteTaskRequest('/ainote/tpl/content', {
+            task_key: taskKey,
+            fsid,
+            page: String(page),
+        });
+        const content = String(detail.content || '');
+        if (!content.trim()) throw new Error('笔记内容为空');
+        return content;
+    }
+
     function waitForNoteEditor(frame, timeout) {
         return new Promise((resolve, reject) => {
             const started = Date.now();
+            let seenAt = 0;
             const tick = () => {
                 let editor = null;
                 try {
@@ -880,9 +953,18 @@
                 } catch (e) {
                     // 继续等待 iframe 加载
                 }
-                if (editor && editor.innerText.trim().length > 20) {
-                    resolve(editor);
-                    return;
+                if (editor) {
+                    const text = editor.innerText.trim();
+                    if (text.length > 20 && !/生成中|预计需要/.test(text)) {
+                        resolve(editor);
+                        return;
+                    }
+                    if (!seenAt) seenAt = Date.now();
+                    // 网盘可能留下只有标题的空笔记，尽快回退到 AI 笔记任务
+                    if (Date.now() - seenAt > 6000) {
+                        reject(new Error('笔记内容为空'));
+                        return;
+                    }
                 }
                 if (Date.now() - started > timeout) {
                     reject(new Error('笔记加载超时'));
@@ -896,26 +978,41 @@
 
     let noteChain = Promise.resolve();
 
-    function getNoteMarkdown(video, base) {
+    function getNoteMarkdown(video, base, onStage) {
         // 批量时网盘笔记编辑器并发加载容易超时，这里排队逐个读取
-        const run = () => loadNoteMarkdown(video, base);
+        const run = () => loadNoteMarkdown(video, base, onStage);
         const task = noteChain.then(run, run);
         noteChain = task.then(() => {}, () => {});
         return task;
     }
 
-    async function loadNoteMarkdown(video, base) {
-        const infoResult = await apiGet('/api/videomark/note', {
-            method: 'query',
-            vfsid: String(video.fs_id),
-        });
-        if (!infoResult || infoResult.errno !== 0) {
-            const message = (infoResult && (infoResult.show_msg || `笔记查询失败 (${infoResult.errno})`)) || '笔记查询失败';
-            if (/no video note|暂无笔记|没有笔记/i.test(message)) throw skipError('暂无笔记');
-            throw new Error(message);
+    async function loadNoteMarkdown(video, base, onStage) {
+        const notify = onStage || (() => {});
+        let info = null;
+        try {
+            const infoResult = await apiGet('/api/videomark/note', {
+                method: 'query',
+                vfsid: String(video.fs_id),
+            });
+            if (infoResult && infoResult.errno === 0) info = infoResult.Info;
+        } catch (err) {
+            // 查询失败时仍尝试 AI 笔记任务
         }
-        const info = infoResult.Info;
-        if (!info || !info.fsid || !info.path) throw skipError('暂无笔记');
+        if (info && info.fsid && info.path) {
+            try {
+                const markdown = await readSavedNoteMarkdown(info, video, base);
+                return await inlineNoteImages(markdown, noteImageUrls(markdown));
+            } catch (err) {
+                // 已保存的笔记可能只是空壳，回退到 AI 笔记任务
+            }
+        }
+        notify('正在生成笔记…');
+        const content = await generateNoteMarkdown(video);
+        const markdown = taskNoteToMarkdown(content, `${base} 笔记`);
+        return await inlineNoteImages(markdown, noteImageUrls(markdown));
+    }
+
+    async function readSavedNoteMarkdown(info, video, base) {
         const uk = await getUk();
         const vmd5 = video.md5 || info.md5 || '';
         const src = `${API_BASE}/fcb/videoedit?fsid=${encodeURIComponent(info.fsid)}&path=${info.path}`
@@ -926,9 +1023,8 @@
         document.body.appendChild(frame);
         try {
             frame.src = src;
-            const editor = await waitForNoteEditor(frame, 20000);
-            const markdown = noteEditorToMarkdown(editor, `${base} 笔记`);
-            return await inlineNoteImages(markdown, editor);
+            const editor = await waitForNoteEditor(frame, 15000);
+            return noteEditorToMarkdown(editor, `${base} 笔记`);
         } finally {
             frame.remove();
         }
@@ -1005,7 +1101,7 @@
         const noteJob = types.has('note') ? (async () => {
             notify('note', '正在读取笔记…');
             try {
-                const markdown = await getNoteMarkdown(video, base);
+                const markdown = await getNoteMarkdown(video, base, text => notify('note', text));
                 if (!markdown.trim()) throw skipError('暂无笔记');
                 artifacts.push({
                     type: 'note',

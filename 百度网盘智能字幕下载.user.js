@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         百度网盘智能字幕下载
 // @namespace    http://github.com/lihaoze123/Baiduyun-subtitle-downloader
-// @version      0.7.0
-// @description  下载百度网盘视频的智能字幕（SRT），支持单个视频与文件夹批量提取，保存目录可自选
+// @version      0.9.0
+// @description  下载百度网盘视频的智能字幕，并导出文稿、课件和笔记，支持单个视频与文件夹批量处理
 // @match        *://pan.baidu.com/*
 // @grant        GM_download
+// @grant        GM_xmlhttpRequest
 // @connect      baidupcs.com
 // @license      GPL3
 // @downloadURL https://update.greasyfork.org/scripts/501784/%E7%99%BE%E5%BA%A6%E7%BD%91%E7%9B%98%E6%99%BA%E8%83%BD%E5%AD%97%E5%B9%95%E4%B8%8B%E8%BD%BD.user.js
@@ -27,29 +28,65 @@
     const DB_NAME = 'bdy-subtitle-helper';
     const DB_STORE = 'settings';
     const DIR_KEY = 'custom-dir';
+    const TYPES_KEY = 'bdy-subtitle-types';
     let customDir = null;
+
+    const TYPE_META = {
+        subtitle: { label: '字幕', empty: '无字幕' },
+        transcript: { label: '文稿', empty: '无文稿' },
+        slides: { label: '课件', empty: '无课件' },
+        note: { label: '笔记', empty: '无笔记' },
+    };
+    const TYPE_ORDER = ['subtitle', 'transcript', 'slides', 'note'];
+    let selectedTypes = new Set(['subtitle']);
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-    let bdstokenPromise = null;
+    let accountPromise = null;
 
-    function getBdstoken(force = false) {
-        if (!bdstokenPromise || force) {
-            bdstokenPromise = fetch(`${API_BASE}/api/loginStatus?clienttype=0&app_id=250528&web=1`, {
-                credentials: 'include',
+    function fetchWithTimeout(url, options = {}, timeout = 30000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        return fetch(url, { ...options, signal: controller.signal })
+            .catch(err => {
+                if (err.name === 'AbortError') throw new Error('网络请求超时');
+                throw err;
             })
+            .finally(() => clearTimeout(timer));
+    }
+
+    function getAccount(force = false) {
+        if (!accountPromise || force) {
+            accountPromise = fetchWithTimeout(`${API_BASE}/api/loginStatus?clienttype=0&app_id=250528&web=1`, {
+                credentials: 'include',
+            }, 15000)
                 .then(res => res.json())
                 .then(json => {
-                    const token = json && json.login_info && json.login_info.bdstoken;
-                    if (!token) throw new Error('未获取到登录状态，请先登录百度网盘');
-                    return token;
+                    const info = json && json.login_info;
+                    if (!info || !info.bdstoken) throw new Error('未获取到登录状态，请先登录百度网盘');
+                    return info;
                 })
                 .catch(err => {
-                    bdstokenPromise = null;
+                    accountPromise = null;
                     throw err;
                 });
         }
-        return bdstokenPromise;
+        return accountPromise;
+    }
+
+    function getBdstoken(force = false) {
+        return getAccount(force).then(info => info.bdstoken);
+    }
+
+    async function getUk() {
+        const info = await getAccount();
+        return info.uk_str || String(info.uk || '');
+    }
+
+    function skipError(message) {
+        const err = new Error(message);
+        err.skip = true;
+        return err;
     }
 
     async function apiGet(path, params, retry = true) {
@@ -62,7 +99,7 @@
             channel: 'chunlei',
             bdstoken: token,
         });
-        const res = await fetch(`${API_BASE}${path}?${query}`, { credentials: 'include' });
+        const res = await fetchWithTimeout(`${API_BASE}${path}?${query}`, { credentials: 'include' });
         if (!res.ok) throw new Error(`接口请求失败 (HTTP ${res.status})`);
         const text = await res.text();
         let data;
@@ -94,7 +131,7 @@
             type: 'M3U8_SUBTITLE_SRT',
             trans: '',
         });
-        const res = await fetch(`${API_BASE}/api/streaming?${query}`, { credentials: 'include' });
+        const res = await fetchWithTimeout(`${API_BASE}/api/streaming?${query}`, { credentials: 'include' });
         const text = await res.text();
         if (text.trim().startsWith('{')) {
             let json = {};
@@ -113,25 +150,80 @@
         return text;
     }
 
-    function subtitleFileName(fn, videoPath) {
-        let base = fn || decodeURIComponent(videoPath.split('/').pop() || '');
-        base = base.replace(/\.[^./\\]+$/, '');
-        base = base.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/[.\s]+$/, '');
-        if (!base) base = 'subtitle';
-        return `${base}.srt`;
-    }
-
     function sanitizeSegment(text) {
         return String(text || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/[.\s]+$/, '');
+    }
+
+    function cleanBaseName(name) {
+        let base = String(name || '').replace(/\.[^./\\]+$/, '');
+        base = sanitizeSegment(base);
+        return base || 'video';
+    }
+
+    function baseNameFor(video) {
+        return cleanBaseName(video.name || decodeURIComponent((video.path || '').split('/').pop() || ''));
+    }
+
+    function subtitleFileName(fn, videoPath) {
+        return `${cleanBaseName(fn || decodeURIComponent(videoPath.split('/').pop() || ''))}.srt`;
     }
 
     function folderOfPath(path) {
         return path.split('/').slice(-2, -1)[0] || '';
     }
 
-    function downloadName(subtitle, videoPath) {
+    function parentOfPath(path) {
+        const index = path.lastIndexOf('/');
+        return index > 0 ? path.slice(0, index) : '/';
+    }
+
+    function downloadPath(fileName, videoPath) {
         const dir = [SAVE_FOLDER, sanitizeSegment(folderOfPath(videoPath))].filter(Boolean).join('/');
-        return [dir, subtitle.fileName].filter(Boolean).join('/');
+        return [dir, fileName].filter(Boolean).join('/');
+    }
+
+    function gmFetchBytes(url) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                responseType: 'arraybuffer',
+                timeout: 60000,
+                onload: response => {
+                    if (response.status < 200 || response.status >= 300) {
+                        reject(new Error(`文件下载失败 (HTTP ${response.status})`));
+                        return;
+                    }
+                    const data = new Uint8Array(response.response || []);
+                    if (!data.byteLength) {
+                        reject(new Error('文件内容为空'));
+                        return;
+                    }
+                    resolve(data);
+                },
+                onerror: () => reject(new Error('文件下载失败')),
+                ontimeout: () => reject(new Error('文件下载超时')),
+            });
+        });
+    }
+
+    async function fetchBytes(url) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 60000);
+        try {
+            const res = await fetch(url, { credentials: 'omit', signal: controller.signal });
+            if (!res.ok) throw new Error(`文件下载失败 (HTTP ${res.status})`);
+            const data = new Uint8Array(await res.arrayBuffer());
+            if (!data.byteLength) throw new Error('文件内容为空');
+            return data;
+        } catch (err) {
+            // 网盘缩略图只有部分响应带 CORS 头，交给脚本管理器绕过
+            if (typeof GM_xmlhttpRequest === 'function') return gmFetchBytes(url);
+            if (err.name === 'AbortError') throw new Error('文件下载超时');
+            throw err;
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     function openDb() {
@@ -191,13 +283,9 @@
         throw new Error('自定义文件夹没有写入权限，请重新选择文件夹');
     }
 
-    async function saveToCustomDir(subtitle) {
+    async function writeCustomFile(fileName, data) {
         const dir = await writableCustomDir();
-        const res = await fetch(subtitle.url, { credentials: 'omit' });
-        if (!res.ok) throw new Error(`字幕文件下载失败 (HTTP ${res.status})`);
-        const data = await res.arrayBuffer();
-        if (!data.byteLength) throw new Error('字幕内容为空');
-        const target = await dir.getFileHandle(subtitle.fileName, { create: true });
+        const target = await dir.getFileHandle(fileName, { create: true });
         const writable = await target.createWritable();
         await writable.write(data);
         await writable.close();
@@ -255,12 +343,21 @@
                 videos.push({
                     name,
                     fs_id: item.fs_id,
+                    md5: item.md5 || '',
                     path: `${dir.replace(/\/+$/, '')}/${name}`,
                 });
             }
             if (list.length < pageSize) break;
         }
         return videos;
+    }
+
+    async function findVideoByPath(path) {
+        const name = path.split('/').pop();
+        const videos = await listVideos(parentOfPath(path));
+        const video = videos.find(item => item.name === name);
+        if (!video) throw new Error('未找到当前视频的文件信息');
+        return video;
     }
 
     function anchorDownloadBlob(blob, fileName) {
@@ -273,10 +370,6 @@
         a.click();
         a.remove();
         setTimeout(() => URL.revokeObjectURL(blobUrl), 120000);
-    }
-
-    function anchorDownload(text, fileName) {
-        anchorDownloadBlob(new Blob([text], { type: 'application/x-subrip;charset=utf-8' }), fileName);
     }
 
     let crcTable = null;
@@ -348,9 +441,10 @@
         return new Blob([...parts, ...central, end], { type: 'application/zip' });
     }
 
-    function zipFileName(dir) {
-        const base = dir.split('/').filter(Boolean).pop() || '字幕';
-        return `${base.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')}_字幕.zip`;
+    function zipFileName(name, types) {
+        const base = sanitizeSegment(name) || '导出';
+        const onlySubtitle = types.size === 1 && types.has('subtitle');
+        return `${base}_${onlySubtitle ? '字幕' : '资料'}.zip`;
     }
 
     function gmDownload(url, fileName) {
@@ -379,30 +473,600 @@
         });
     }
 
-    async function saveSubtitle(subtitle, videoPath) {
+    function srtTimeToSeconds(value) {
+        const match = value.match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/);
+        if (!match) return 0;
+        return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number(match[4]) / 1000;
+    }
+
+    function parseSrt(text) {
+        const cues = [];
+        const blocks = text.replace(/^\uFEFF/, '').replace(/\r/g, '').split(/\n{2,}/);
+        for (const block of blocks) {
+            const lines = block.split('\n').map(line => line.trim()).filter(Boolean);
+            const timingIndex = lines.findIndex(line => line.includes('-->'));
+            if (timingIndex < 0) continue;
+            const times = lines[timingIndex].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
+            if (!times) continue;
+            const content = lines.slice(timingIndex + 1).join(' ').trim();
+            if (!content) continue;
+            cues.push({
+                start: srtTimeToSeconds(times[1]),
+                end: srtTimeToSeconds(times[2]),
+                text: content,
+            });
+        }
+        return cues;
+    }
+
+    function joinCueText(left, right) {
+        if (!left) return right;
+        if (!right) return left;
+        const needsSpace = /[A-Za-z0-9]$/.test(left) && /^[A-Za-z0-9]/.test(right);
+        return left + (needsSpace ? ' ' : '') + right;
+    }
+
+    function buildTranscript(srtText) {
+        const cues = parseSrt(srtText).filter(cue => !/此字幕由AI自动生成/.test(cue.text));
+        const paragraphs = [];
+        let current = '';
+        let prevEnd = 0;
+        for (const cue of cues) {
+            if (current) {
+                const gap = cue.start - prevEnd;
+                const endsSentence = /[。！？!?；;]$/.test(current);
+                if ((gap > 2.5 && current.length > 40) || (endsSentence && current.length > 120) || current.length > 260) {
+                    paragraphs.push(current);
+                    current = '';
+                }
+            }
+            current = joinCueText(current, cue.text);
+            prevEnd = cue.end;
+        }
+        if (current) paragraphs.push(current);
+        return paragraphs.join('\n\n');
+    }
+
+    function splitSprite(bytes) {
+        if (bytes.length < 60) throw new Error('课件图片格式异常');
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const start = view.getUint32(4, true);
+        if (start < 48 || start > bytes.length) throw new Error('课件图片格式异常');
+        const lengths = [];
+        for (let offset = 48; offset + 4 <= start; offset += 4) {
+            const length = view.getUint32(offset, true);
+            if (length) lengths.push(length);
+        }
+        const slices = [];
+        let offset = start;
+        for (const length of lengths) {
+            if (offset + length > bytes.length) break;
+            const slice = bytes.subarray(offset, offset + length);
+            if (slice[0] === 0xff && slice[1] === 0xd8) slices.push(slice);
+            offset += length;
+        }
+        if (!slices.length) throw new Error('课件图片解析失败');
+        return slices;
+    }
+
+    async function getCoursewarePages(video, onProgress) {
+        const fsid = String(video.fs_id);
+        const shareUk = await getUk();
+        const status = await apiGet('/aitrans/ppt/common', {
+            method: 'status',
+            fsid,
+            share_uk: shareUk,
+            client_type: '2',
+        });
+        if (!status || status.errno !== 0) {
+            throw new Error((status && (status.show_msg || `课件状态查询失败 (${status.errno})`)) || '课件状态查询失败');
+        }
+        const info = status.data || {};
+        if (info.ppt_status !== 300) throw skipError(info.msg || '暂无课件');
+        const result = await apiGet('/aitrans/ppt/get', {
+            fsid,
+            share_uk: shareUk,
+            client_type: '2',
+        });
+        if (!result || result.errno !== 0) {
+            throw new Error((result && (result.show_msg || `课件读取失败 (${result.errno})`)) || '课件读取失败');
+        }
+        const sprites = (result.data && result.data.list) || [];
+        if (!sprites.length) throw skipError('暂无课件');
+        sprites.sort((a, b) => a.start_page - b.start_page);
+        const totalPages = sprites.reduce((sum, sprite) => sum + Math.max(0, (sprite.end_page || sprite.start_page) - sprite.start_page + 1), 0);
+        const pages = [];
+        for (const sprite of sprites) {
+            const bytes = await fetchBytes(sprite.img_url);
+            const slices = splitSprite(bytes);
+            const times = sprite.img_timestamp || [];
+            slices.forEach((data, index) => {
+                pages.push({
+                    page: sprite.start_page + index,
+                    time: times[index] || '',
+                    data,
+                });
+            });
+            if (onProgress) onProgress(Math.min(pages.length, totalPages), totalPages);
+        }
+        pages.sort((a, b) => a.page - b.page);
+        return pages;
+    }
+
+    function jpegInfo(bytes) {
+        let offset = 2;
+        while (offset + 9 < bytes.length) {
+            if (bytes[offset] !== 0xff) {
+                offset++;
+                continue;
+            }
+            const marker = bytes[offset + 1];
+            if (marker === 0xd8 || marker === 0xd9) {
+                offset += 2;
+                continue;
+            }
+            const length = (bytes[offset + 2] << 8) | bytes[offset + 3];
+            if (length < 2) break;
+            if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+                return {
+                    height: (bytes[offset + 5] << 8) | bytes[offset + 6],
+                    width: (bytes[offset + 7] << 8) | bytes[offset + 8],
+                    components: bytes[offset + 9],
+                };
+            }
+            offset += 2 + length;
+        }
+        return { width: 1024, height: 576, components: 3 };
+    }
+
+    function pdfTitleHex(text) {
+        let hex = 'FEFF';
+        for (let i = 0; i < text.length; i++) {
+            hex += text.charCodeAt(i).toString(16).padStart(4, '0').toUpperCase();
+        }
+        return hex;
+    }
+
+    function buildPdf(pages) {
+        const encoder = new TextEncoder();
+        const outlineBase = 4 + pages.length * 3;
+        const objects = new Array(outlineBase + pages.length);
+        objects[1] = { text: '<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >>' };
+        objects[2] = {
+            text: `<< /Type /Pages /Kids [${pages.map((_, index) => `${4 + index * 3} 0 R`).join(' ')}] /Count ${pages.length} >>`,
+        };
+        objects[3] = {
+            text: `<< /Type /Outlines /First ${outlineBase} 0 R /Last ${outlineBase + pages.length - 1} 0 R /Count ${pages.length} >>`,
+        };
+        pages.forEach((page, index) => {
+            const pageObj = 4 + index * 3;
+            const contentObj = pageObj + 1;
+            const imageObj = pageObj + 2;
+            const jpeg = jpegInfo(page.data);
+            const width = jpeg.width || 1024;
+            const height = jpeg.height || 576;
+            const colorSpace = jpeg.components === 1 ? '/DeviceGray' : jpeg.components === 4 ? '/DeviceCMYK' : '/DeviceRGB';
+            const content = `q\n${width} 0 0 ${height} 0 0 cm\n/Im0 Do\nQ\n`;
+            objects[pageObj] = {
+                text: `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${width} ${height}] /Resources << /XObject << /Im0 ${imageObj} 0 R >> >> /Contents ${contentObj} 0 R >>`,
+            };
+            objects[contentObj] = {
+                text: `<< /Length ${content.length} >>\nstream\n${content}endstream`,
+            };
+            objects[imageObj] = {
+                text: `<< /Type /XObject /Subtype /Image /Width ${width} /Height ${height} /ColorSpace ${colorSpace} /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.data.length} >>\nstream\n`,
+                data: page.data,
+                tail: '\nendstream',
+            };
+            const title = `第 ${page.page || index + 1} 页${page.time ? ` ${page.time}` : ''}`;
+            const prev = index > 0 ? ` /Prev ${outlineBase + index - 1} 0 R` : '';
+            const next = index < pages.length - 1 ? ` /Next ${outlineBase + index + 1} 0 R` : '';
+            objects[outlineBase + index] = {
+                text: `<< /Title <${pdfTitleHex(title)}> /Parent 3 0 R /Dest [${pageObj} 0 R /Fit]${prev}${next} >>`,
+            };
+        });
+
+        const chunks = [];
+        const offsets = [];
+        let length = 0;
+        const push = part => {
+            const bytes = typeof part === 'string' ? encoder.encode(part) : part;
+            chunks.push(bytes);
+            length += bytes.length;
+        };
+        push('%PDF-1.4\n%\u00e2\u00e3\u00cf\u00d3\n');
+        for (let number = 1; number < objects.length; number++) {
+            const item = objects[number];
+            if (!item) continue;
+            offsets[number] = length;
+            push(`${number} 0 obj\n`);
+            push(item.text);
+            if (item.data) push(item.data);
+            if (item.tail) push(item.tail);
+            push('\nendobj\n');
+        }
+        const xrefStart = length;
+        push(`xref\n0 ${objects.length}\n`);
+        push('0000000000 65535 f \n');
+        for (let number = 1; number < objects.length; number++) {
+            if (!objects[number]) {
+                push('0000000000 65535 f \n');
+            } else {
+                push(`${String(offsets[number]).padStart(10, '0')} 00000 n \n`);
+            }
+        }
+        push(`trailer\n<< /Size ${objects.length} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF\n`);
+
+        const output = new Uint8Array(length);
+        let position = 0;
+        for (const chunk of chunks) {
+            output.set(chunk, position);
+            position += chunk.length;
+        }
+        return output;
+    }
+
+    function inlineMarkdown(node) {
+        let output = '';
+        for (const child of node.childNodes) {
+            if (child.nodeType === 3) {
+                output += child.nodeValue.replace(/\s+/g, ' ');
+                continue;
+            }
+            if (child.nodeType !== 1) continue;
+            const tag = child.tagName.toLowerCase();
+            if (child.classList && (child.classList.contains('ql-ui') || child.classList.contains('ql-timestamp-icon'))) continue;
+            if (tag === 'br') {
+                output += '  \n';
+                continue;
+            }
+            if (tag === 'img') {
+                const src = child.getAttribute('src');
+                if (src) output += `![课件截图](${src})`;
+                continue;
+            }
+            if (tag === 'strong' || tag === 'b') {
+                output += `**${inlineMarkdown(child)}**`;
+                continue;
+            }
+            if (tag === 'em' || tag === 'i') {
+                output += `*${inlineMarkdown(child)}*`;
+                continue;
+            }
+            if (tag === 'code') {
+                output += `\`${child.textContent}\``;
+                continue;
+            }
+            if (tag === 'a') {
+                const href = child.getAttribute('href');
+                const text = inlineMarkdown(child);
+                output += href ? `[${text}](${href})` : text;
+                continue;
+            }
+            output += inlineMarkdown(child);
+        }
+        return output;
+    }
+
+    function markdownTable(table) {
+        const rows = [...table.querySelectorAll('tr')].map(row => [...row.querySelectorAll('td,th')].map(cell => {
+            const editor = cell.querySelector('.ql-editor') || cell;
+            return inlineMarkdown(editor).replace(/\s+/g, ' ').trim().replace(/\|/g, '\\|');
+        }));
+        if (!rows.length) return '';
+        const width = Math.max(...rows.map(row => row.length));
+        const pad = row => {
+            while (row.length < width) row.push('');
+            return row;
+        };
+        const header = pad(rows[0].slice());
+        const lines = [
+            `| ${header.join(' | ')} |`,
+            `| ${header.map(() => '---').join(' | ')} |`,
+        ];
+        rows.slice(1).forEach(row => lines.push(`| ${pad(row).join(' | ')} |`));
+        return lines.join('\n');
+    }
+
+    function markdownList(list, depth) {
+        const ordered = (list.getAttribute('list-type') || '') === 'ordered' || list.tagName.toLowerCase() === 'ol';
+        const lines = [];
+        let index = 1;
+        for (const item of list.children) {
+            if (item.tagName.toLowerCase() !== 'li') continue;
+            const indentMatch = String(item.className || '').match(/ql-indent-(\d)/);
+            const indent = indentMatch ? Number(indentMatch[1]) : depth;
+            const marker = ordered ? `${index++}. ` : '- ';
+            const clone = item.cloneNode(true);
+            clone.querySelectorAll('ul, ol, .ql-ui').forEach(node => node.remove());
+            const text = inlineMarkdown(clone).replace(/\s+/g, ' ').trim();
+            if (text) lines.push(`${'  '.repeat(indent)}${marker}${text}`);
+            for (const nested of item.querySelectorAll(':scope > ul, :scope > ol')) {
+                const nestedText = markdownList(nested, indent + 1);
+                if (nestedText) lines.push(nestedText);
+            }
+        }
+        return lines.join('\n');
+    }
+
+    function markdownBlocks(root) {
+        const blocks = [];
+        for (const node of root.children) {
+            const tag = node.tagName.toLowerCase();
+            if (node.classList && node.classList.contains('ql-ui')) continue;
+            if (node.classList && node.classList.contains('ql-divider')) continue;
+            if (/^h[1-6]$/.test(tag)) {
+                const level = Math.max(2, Number(tag[1]) - 2);
+                const text = inlineMarkdown(node).replace(/\s+/g, ' ').trim();
+                if (text) blocks.push(`${'#'.repeat(level)} ${text}`);
+            } else if (tag === 'p') {
+                const text = inlineMarkdown(node).replace(/\s+/g, ' ').trim();
+                if (text) blocks.push(text);
+            } else if (tag === 'ul' || tag === 'ol') {
+                const text = markdownList(node, 0);
+                if (text) blocks.push(text);
+            } else if (tag === 'table') {
+                const text = markdownTable(node);
+                if (text) blocks.push(text);
+            } else if (tag === 'blockquote') {
+                const text = inlineMarkdown(node).trim();
+                if (text) blocks.push(text.split('\n').map(line => `> ${line}`).join('\n'));
+            } else if (tag === 'pre') {
+                const text = node.textContent.trimEnd();
+                if (text) blocks.push(`\`\`\`\n${text}\n\`\`\``);
+            } else if (tag === 'img') {
+                const src = node.getAttribute('src');
+                if (src) blocks.push(`![课件截图](${src})`);
+            } else {
+                const text = markdownBlocks(node);
+                if (text) blocks.push(text);
+            }
+        }
+        return blocks.join('\n\n');
+    }
+
+    function noteEditorToMarkdown(editor, title) {
+        const clone = editor.cloneNode(true);
+        const body = markdownBlocks(clone);
+        return [`# ${title}`, body].filter(Boolean).join('\n\n');
+    }
+
+    function bytesToBase64(bytes) {
+        let binary = '';
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(binary);
+    }
+
+    function imageMime(bytes, url) {
+        if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+        if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+        if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+        if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return 'image/webp';
+        const ext = (url.split('?')[0].match(/\.([a-z0-9]+)$/i) || [])[1];
+        return ext ? `image/${ext.toLowerCase()}` : 'image/jpeg';
+    }
+
+    async function inlineNoteImages(markdown, editor) {
+        const urls = [...new Set([...editor.querySelectorAll('img')]
+            .map(img => img.getAttribute('src'))
+            .filter(url => url && /^https?:/i.test(url)))];
+        const queue = urls.slice();
+        const worker = async () => {
+            while (queue.length) {
+                const url = queue.shift();
+                try {
+                    const bytes = await fetchBytes(url);
+                    const dataUrl = `data:${imageMime(bytes, url)};base64,${bytesToBase64(bytes)}`;
+                    markdown = markdown.split(url).join(dataUrl);
+                } catch (err) {
+                    // 图片下载失败时保留原始链接，不影响笔记文字导出
+                }
+            }
+        };
+        await Promise.all(Array.from({ length: Math.min(4, urls.length) }, worker));
+        return markdown;
+    }
+
+    function waitForNoteEditor(frame, timeout) {
+        return new Promise((resolve, reject) => {
+            const started = Date.now();
+            const tick = () => {
+                let editor = null;
+                try {
+                    const doc = frame.contentDocument;
+                    editor = doc && doc.querySelector('.ql-editor');
+                } catch (e) {
+                    // 继续等待 iframe 加载
+                }
+                if (editor && editor.innerText.trim().length > 20) {
+                    resolve(editor);
+                    return;
+                }
+                if (Date.now() - started > timeout) {
+                    reject(new Error('笔记加载超时'));
+                    return;
+                }
+                setTimeout(tick, 300);
+            };
+            tick();
+        });
+    }
+
+    let noteChain = Promise.resolve();
+
+    function getNoteMarkdown(video, base) {
+        // 批量时网盘笔记编辑器并发加载容易超时，这里排队逐个读取
+        const run = () => loadNoteMarkdown(video, base);
+        const task = noteChain.then(run, run);
+        noteChain = task.then(() => {}, () => {});
+        return task;
+    }
+
+    async function loadNoteMarkdown(video, base) {
+        const infoResult = await apiGet('/api/videomark/note', {
+            method: 'query',
+            vfsid: String(video.fs_id),
+        });
+        if (!infoResult || infoResult.errno !== 0) {
+            const message = (infoResult && (infoResult.show_msg || `笔记查询失败 (${infoResult.errno})`)) || '笔记查询失败';
+            if (/no video note|暂无笔记|没有笔记/i.test(message)) throw skipError('暂无笔记');
+            throw new Error(message);
+        }
+        const info = infoResult.Info;
+        if (!info || !info.fsid || !info.path) throw skipError('暂无笔记');
+        const uk = await getUk();
+        const vmd5 = video.md5 || info.md5 || '';
+        const src = `${API_BASE}/fcb/videoedit?fsid=${encodeURIComponent(info.fsid)}&path=${info.path}`
+            + `&action=view&uk=${encodeURIComponent(uk)}&vfsid=${encodeURIComponent(video.fs_id)}`
+            + `&vmd5=${encodeURIComponent(vmd5)}&theme=light&from_scene=video_page`;
+        const frame = document.createElement('iframe');
+        frame.style.cssText = 'position:fixed;left:-9999px;top:0;width:900px;height:600px;visibility:hidden;';
+        document.body.appendChild(frame);
+        try {
+            frame.src = src;
+            const editor = await waitForNoteEditor(frame, 20000);
+            const markdown = noteEditorToMarkdown(editor, `${base} 笔记`);
+            return await inlineNoteImages(markdown, editor);
+        } finally {
+            frame.remove();
+        }
+    }
+
+    async function exportVideoFiles(video, onStage) {
+        const types = selectedTypes;
+        const base = baseNameFor(video);
+        const artifacts = [];
+        const problems = [];
+        const notify = onStage || (() => {});
+        const addProblem = (type, err) => {
+            problems.push({
+                type,
+                skip: !!err.skip || /暂无智能字幕/.test(err.message || ''),
+                message: err.message || String(err),
+            });
+        };
+
+        const subtitleJob = (async () => {
+            if (!types.has('subtitle') && !types.has('transcript')) return;
+            notify('subtitle', types.has('subtitle') ? '正在获取字幕…' : '正在获取文稿…');
+            try {
+                let subtitle;
+                try {
+                    subtitle = await getSubtitleForPath(video.path);
+                } catch (err) {
+                    if (types.has('subtitle')) addProblem('subtitle', err);
+                    if (types.has('transcript')) addProblem('transcript', err);
+                    return;
+                }
+                if (types.has('subtitle')) {
+                    artifacts.push({ type: 'subtitle', fileName: subtitle.fileName, url: subtitle.url });
+                }
+                if (types.has('transcript')) {
+                    try {
+                        const srt = await fetchBytes(subtitle.url);
+                        const text = buildTranscript(new TextDecoder().decode(srt));
+                        if (!text.trim()) throw new Error('字幕内容为空');
+                        artifacts.push({
+                            type: 'transcript',
+                            fileName: `${base}_文稿.txt`,
+                            data: new TextEncoder().encode(text),
+                            mime: 'text/plain;charset=utf-8',
+                        });
+                    } catch (err) {
+                        addProblem('transcript', err);
+                    }
+                }
+            } finally {
+                notify('subtitle', null);
+            }
+        })();
+
+        const slidesJob = types.has('slides') ? (async () => {
+            notify('slides', '正在获取课件…');
+            try {
+                const pages = await getCoursewarePages(video, (done, total) => {
+                    notify('slides', total ? `正在获取课件（${done}/${total}）…` : `正在获取课件（${done} 页）…`);
+                });
+                artifacts.push({
+                    type: 'slides',
+                    fileName: `${base}_课件.pdf`,
+                    data: buildPdf(pages),
+                    mime: 'application/pdf',
+                });
+            } catch (err) {
+                addProblem('slides', err);
+            } finally {
+                notify('slides', null);
+            }
+        })() : null;
+
+        const noteJob = types.has('note') ? (async () => {
+            notify('note', '正在读取笔记…');
+            try {
+                const markdown = await getNoteMarkdown(video, base);
+                if (!markdown.trim()) throw skipError('暂无笔记');
+                artifacts.push({
+                    type: 'note',
+                    fileName: `${base}_笔记.md`,
+                    data: new TextEncoder().encode(markdown),
+                    mime: 'text/markdown;charset=utf-8',
+                });
+            } catch (err) {
+                addProblem('note', err);
+            } finally {
+                notify('note', null);
+            }
+        })() : null;
+
+        await Promise.all([subtitleJob, slidesJob, noteJob].filter(Boolean));
+        artifacts.sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
+        problems.sort((a, b) => TYPE_ORDER.indexOf(a.type) - TYPE_ORDER.indexOf(b.type));
+        return { artifacts, problems };
+    }
+
+    function artifactBytes(artifact) {
+        if (artifact.data) return Promise.resolve(artifact.data);
+        return fetchBytes(artifact.url);
+    }
+
+    async function saveArtifactToDisk(artifact, video) {
+        const target = downloadPath(artifact.fileName, video.path);
         if (customDir) {
-            await saveToCustomDir(subtitle);
+            await writeCustomFile(artifact.fileName, await artifactBytes(artifact));
             return;
         }
         if (typeof GM_download === 'function') {
-            try {
-                await gmDownload(subtitle.url, downloadName(subtitle, videoPath));
+            if (artifact.url) {
+                try {
+                    await gmDownload(artifact.url, target);
+                    return;
+                } catch (err) {
+                    // 某些管理器不允许 name 带子目录，退回下载目录根部
+                    console.warn('[百度网盘字幕] 指定子目录失败，改为下载目录根部', err);
+                }
+                await gmDownload(artifact.url, artifact.fileName);
                 return;
-            } catch (err) {
-                // 某些管理器不允许 name 带子目录，退回下载目录根部，仍保持静默
-                console.warn('[百度网盘字幕] 指定子目录失败，改为下载目录根部', err);
             }
-            await gmDownload(subtitle.url, subtitle.fileName);
+            const blob = new Blob([artifact.data], { type: artifact.mime || 'application/octet-stream' });
+            const blobUrl = URL.createObjectURL(blob);
+            try {
+                await gmDownload(blobUrl, target);
+            } catch (err) {
+                console.warn('[百度网盘字幕] 生成文件下载失败，改用浏览器下载', err);
+                anchorDownloadBlob(blob, artifact.fileName);
+            } finally {
+                setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+            }
             return;
         }
-        const res = await fetch(subtitle.url, { credentials: 'omit' });
-        if (!res.ok) throw new Error(`字幕文件下载失败 (HTTP ${res.status})`);
-        const text = await res.text();
-        if (!text.trim()) throw new Error('字幕内容为空');
-        anchorDownload(text, subtitle.fileName);
+        const bytes = await artifactBytes(artifact);
+        const mime = artifact.mime || (artifact.type === 'subtitle' ? 'application/x-subrip;charset=utf-8' : 'application/octet-stream');
+        anchorDownloadBlob(new Blob([bytes], { type: mime }), artifact.fileName);
     }
 
-    async function runBatch(videos, hooks, save) {
+    async function runBatch(videos, hooks, process) {
         const queue = videos.slice();
         const results = [];
         const workerCount = Math.min(CONCURRENCY, queue.length);
@@ -412,11 +1076,13 @@
                 const video = queue.shift();
                 let outcome;
                 try {
-                    const subtitle = await getSubtitleForPath(video.path);
-                    await save(subtitle, video);
-                    outcome = { ok: true, file: subtitle.fileName, video };
+                    outcome = await process(video);
                 } catch (err) {
-                    outcome = { ok: false, reason: err.message || String(err), video };
+                    outcome = {
+                        video,
+                        saved: [],
+                        problems: [{ type: 'subtitle', skip: false, message: err.message || String(err) }],
+                    };
                 }
                 results.push(outcome);
                 hooks.onResult(results.length, videos.length, outcome);
@@ -471,10 +1137,14 @@
         cancelBtn: null,
         copyBtn: null,
         toolbarEl: null,
+        typeChips: [],
         statsEl: null,
         statOk: null,
         statNo: null,
         statErr: null,
+        statOkLabel: null,
+        statNoLabel: null,
+        statErrLabel: null,
         statusEl: null,
         progressEl: null,
         progressBar: null,
@@ -491,9 +1161,62 @@
     let entryTimer = 0;
     let dirTouched = false;
 
+    function loadTypeSelection() {
+        try {
+            const raw = localStorage.getItem(TYPES_KEY);
+            if (!raw) return;
+            const saved = JSON.parse(raw);
+            const valid = Array.isArray(saved) ? saved.filter(type => TYPE_META[type]) : [];
+            if (valid.length) selectedTypes = new Set(valid);
+        } catch (e) {
+            // 忽略损坏的本地设置
+        }
+    }
+
+    function persistTypeSelection() {
+        try {
+            localStorage.setItem(TYPES_KEY, JSON.stringify([...selectedTypes]));
+        } catch (e) {
+            // 本地存储不可用时只对当前页面生效
+        }
+    }
+
+    function updateStatLabels() {
+        if (!ui.statNoLabel) return;
+        const onlySubtitle = selectedTypes.size === 1 && selectedTypes.has('subtitle');
+        ui.statOkLabel.textContent = '成功';
+        ui.statNoLabel.textContent = onlySubtitle ? '无字幕' : '跳过';
+        ui.statErrLabel.textContent = '失败';
+    }
+
+    function renderTypeChips() {
+        for (const chip of ui.typeChips) {
+            const active = selectedTypes.has(chip.dataset.type);
+            chip.classList.toggle('active', active);
+            chip.setAttribute('aria-pressed', String(active));
+        }
+        updateStatLabels();
+        restoreActionLabel();
+    }
+
+    function toggleType(type) {
+        if (ui.running || !TYPE_META[type]) return;
+        if (selectedTypes.has(type)) {
+            if (selectedTypes.size === 1) {
+                setStatus('至少保留一项导出内容', 'warn');
+                return;
+            }
+            selectedTypes.delete(type);
+        } else {
+            selectedTypes.add(type);
+        }
+        persistTypeSelection();
+        renderTypeChips();
+    }
+
     function saveHint(folderName) {
         if (customDir) return `自定义文件夹：${customDir.name}/`;
-        if (typeof GM_download !== 'function') return '未检测到 Tampermonkey，批量时将打包为 ZIP';
+        if (typeof GM_download !== 'function') return '未检测到 Tampermonkey，多文件时将打包为 ZIP';
         const dir = [SAVE_FOLDER, sanitizeSegment(folderName)].filter(Boolean).join('/');
         return `下载目录/${dir}/`;
     }
@@ -595,7 +1318,7 @@
         ui.statsEl.classList.toggle('hidden', !visible);
         if (!visible) return;
         ui.statOk.textContent = String(stats.ok);
-        ui.statNo.textContent = String(stats.noSubtitle);
+        ui.statNo.textContent = String(stats.skipped);
         ui.statErr.textContent = String(stats.failed);
     }
 
@@ -646,7 +1369,12 @@
 
     function restoreActionLabel() {
         if (!ui.actionLabel || !ui.context) return;
-        ui.actionLabel.textContent = ui.context.mode === 'video' ? '下载本视频字幕' : '批量下载字幕';
+        const onlySubtitle = selectedTypes.size === 1 && selectedTypes.has('subtitle');
+        if (ui.context.mode === 'video') {
+            ui.actionLabel.textContent = onlySubtitle ? '下载本视频字幕' : '导出所选内容';
+        } else {
+            ui.actionLabel.textContent = onlySubtitle ? '批量下载字幕' : '批量导出所选内容';
+        }
     }
 
     function setRunning(running) {
@@ -655,10 +1383,14 @@
             ui.actionBtn.disabled = running;
             ui.actionBtn.classList.toggle('loading', running);
         }
+        for (const chip of ui.typeChips) chip.disabled = running;
         if (running) {
             ui.cancelRequested = false;
             ui.problems = [];
-            if (ui.actionLabel) ui.actionLabel.textContent = '正在获取字幕…';
+            if (ui.actionLabel) {
+                const onlySubtitle = selectedTypes.size === 1 && selectedTypes.has('subtitle');
+                ui.actionLabel.textContent = onlySubtitle ? '正在获取字幕…' : '正在导出…';
+            }
             if (ui.cancelBtn) {
                 ui.cancelBtn.disabled = false;
                 ui.cancelBtn.textContent = '取消';
@@ -704,20 +1436,19 @@
         }
         if (ui.running) return;
         ui.progressEl.classList.add('hidden');
-        setStats({ ok: 0, noSubtitle: 0, failed: 0 }, false);
+        setStats({ ok: 0, skipped: 0, failed: 0 }, false);
         ui.problems = [];
         clearLog();
         setStatus('');
         if (context.mode === 'video') {
             ui.ctxNameEl.textContent = context.name;
             ui.ctxMetaEl.textContent = '视频播放页';
-            ui.actionLabel.textContent = '下载本视频字幕';
         } else {
             ui.ctxNameEl.textContent = context.name;
             ui.ctxMetaEl.textContent = '正在统计视频数量…';
-            ui.actionLabel.textContent = '批量下载字幕';
             if (!ui.panel.classList.contains('hidden')) refreshFolderCount();
         }
+        renderTypeChips();
         updateSaveHint();
         updateToolbar();
     }
@@ -869,7 +1600,7 @@
             const btn = document.createElement('button');
             btn.id = FALLBACK_ID;
             btn.type = 'button';
-            btn.title = '下载字幕';
+            btn.title = '字幕与资料导出';
             btn.innerHTML = entryIconHtml();
             btn.addEventListener('click', event => {
                 event.preventDefault();
@@ -911,7 +1642,12 @@
         ui.entryBtn = createEntryButton(mode, anchor);
     }
 
-    async function downloadCurrentVideo() {
+    function problemText(problem, videoName) {
+        if (problem.skip) return `${TYPE_META[problem.type].empty}：${videoName}`;
+        return `失败：${videoName}（${TYPE_META[problem.type].label}：${problem.message}）`;
+    }
+
+    async function exportCurrentVideo() {
         if (ui.running || !ui.context || ui.context.mode !== 'video') return;
         const context = ui.context;
         if (customDir) {
@@ -923,12 +1659,62 @@
             }
         }
         setRunning(true);
-        setStatus('正在获取字幕地址…');
+        clearLog();
+        ui.problems = [];
+        setStatus('正在准备导出…');
+        const stageText = new Map();
+        const updateStage = (key, text) => {
+            if (text) stageText.set(key, text);
+            else stageText.delete(key);
+            const values = [...stageText.values()];
+            setStatus(values.length ? values.join(' · ') : '正在整理文件…');
+        };
         try {
-            const subtitle = await getSubtitleForPath(context.path);
-            setStatus(`正在保存：${subtitle.fileName}`);
-            await saveSubtitle(subtitle, context.path);
-            setStatus(`已保存：${subtitle.fileName}`, 'ok');
+            const video = await findVideoByPath(context.path);
+            const { artifacts, problems } = await exportVideoFiles(video, updateStage);
+            const useZip = !customDir && typeof GM_download !== 'function' && artifacts.length > 1;
+            let saved = 0;
+            if (useZip) {
+                setStatus('正在打包…');
+                const zipEntries = [];
+                for (const artifact of artifacts) {
+                    zipEntries.push({ name: artifact.fileName, data: await artifactBytes(artifact) });
+                    addLog(`已获取：${artifact.fileName}`, 'ok');
+                    saved++;
+                }
+                if (zipEntries.length) {
+                    const fileName = zipFileName(cleanBaseName(context.name), selectedTypes);
+                    anchorDownloadBlob(buildZip(zipEntries), fileName);
+                    addLog(`已打包：${fileName}`, 'ok');
+                }
+            } else {
+                for (const artifact of artifacts) {
+                    setStatus(`正在保存：${artifact.fileName}`);
+                    try {
+                        await saveArtifactToDisk(artifact, video);
+                        saved++;
+                        addLog(`已保存：${artifact.fileName}`, 'ok');
+                    } catch (err) {
+                        problems.push({ type: artifact.type, skip: false, message: err.message || String(err) });
+                    }
+                }
+            }
+            const seen = new Set();
+            for (const problem of problems) {
+                const text = problemText(problem, context.name);
+                if (seen.has(text)) continue;
+                seen.add(text);
+                ui.problems.push(text);
+                addLog(text, problem.skip ? 'warn' : 'err');
+            }
+            const errors = problems.filter(problem => !problem.skip).length;
+            if (!artifacts.length) {
+                setStatus(problems.length ? problems[0].message : '没有可导出的内容', 'warn');
+            } else if (errors) {
+                setStatus(`已保存 ${saved} 个文件，${errors} 项失败`, 'warn');
+            } else {
+                setStatus(useZip ? '已打包下载' : `已保存 ${saved} 个文件`, 'ok');
+            }
         } catch (err) {
             setStatus(err.message, 'err');
             addLog(err.message, 'err');
@@ -950,31 +1736,42 @@
         const dir = ui.context.path;
         const useZip = !customDir && typeof GM_download !== 'function';
         const zipEntries = [];
-        const save = async (subtitle, video) => {
-            if (customDir) {
-                await saveToCustomDir(subtitle);
-                return;
-            }
-            if (!useZip) {
-                await saveSubtitle(subtitle, video.path);
-                return;
-            }
-            const res = await fetch(subtitle.url, { credentials: 'omit' });
-            if (!res.ok) throw new Error(`字幕文件下载失败 (HTTP ${res.status})`);
-            const data = new Uint8Array(await res.arrayBuffer());
-            if (!data.length) throw new Error('字幕内容为空');
-            zipEntries.push({ name: subtitle.fileName, data });
+        const seenProblems = new Set();
+        const reportProblem = (text, kind) => {
+            if (seenProblems.has(text)) return;
+            seenProblems.add(text);
+            ui.problems.push(text);
+            addLog(text, kind);
         };
+        const process = async video => {
+            const { artifacts, problems } = await exportVideoFiles(video);
+            const saved = [];
+            for (const artifact of artifacts) {
+                try {
+                    if (useZip) {
+                        zipEntries.push({ name: artifact.fileName, data: await artifactBytes(artifact) });
+                    } else {
+                        await saveArtifactToDisk(artifact, video);
+                    }
+                    saved.push(artifact);
+                } catch (err) {
+                    problems.push({ type: artifact.type, skip: false, message: err.message || String(err) });
+                }
+            }
+            return { video, saved, problems };
+        };
+
         setRunning(true);
         clearLog();
         ui.problems = [];
-        setStats({ ok: 0, noSubtitle: 0, failed: 0 }, true);
+        setStats({ ok: 0, skipped: 0, failed: 0 }, true);
         setStatus('正在读取目录…');
         setProgress(0, 0, '');
         ui.ctxMetaEl.textContent = '正在读取目录…';
         let ok = 0;
+        let skipped = 0;
         let failed = 0;
-        let noSubtitle = 0;
+        const onlySubtitle = selectedTypes.size === 1 && selectedTypes.has('subtitle');
         try {
             const videos = await listVideos(dir);
             countCache = { dir, count: videos.length, time: Date.now() };
@@ -983,36 +1780,36 @@
                 setStatus('当前文件夹没有视频', 'err');
                 return;
             }
-            setStatus(`开始获取 ${videos.length} 个字幕…`);
+            setStatus(`开始导出 ${videos.length} 个视频的内容…`);
             setProgress(0, videos.length);
             const result = await runBatch(
                 videos,
                 {
                     isCancelled: () => ui.cancelRequested,
                     onResult: (done, total, outcome) => {
-                        if (outcome.ok) {
-                            ok++;
-                            addLog(`${useZip ? '已获取' : '已保存'}：${outcome.file}`, 'ok');
-                        } else if (/暂无智能字幕/.test(outcome.reason)) {
-                            noSubtitle++;
-                            ui.problems.push(`无字幕：${outcome.video.name}`);
-                            addLog(`无字幕：${outcome.video.name}`, 'warn');
-                        } else {
-                            failed++;
-                            ui.problems.push(`失败：${outcome.video.name}（${outcome.reason}）`);
-                            addLog(`失败：${outcome.video.name}（${outcome.reason}）`, 'err');
+                        const errors = outcome.problems.filter(problem => !problem.skip);
+                        if (errors.length) failed++;
+                        else if (outcome.saved.length) ok++;
+                        else skipped++;
+                        for (const artifact of outcome.saved) {
+                            addLog(`${useZip ? '已获取' : '已保存'}：${artifact.fileName}`, 'ok');
                         }
-                        setStats({ ok, noSubtitle, failed }, true);
+                        for (const problem of outcome.problems) {
+                            reportProblem(problemText(problem, outcome.video.name), problem.skip ? 'warn' : 'err');
+                        }
+                        setStats({ ok, skipped, failed }, true);
                         setProgress(done, total);
                         updateToolbar();
                     },
                 },
-                save
+                process
             );
-            let summary = `成功 ${ok}，无字幕 ${noSubtitle}，失败 ${failed}`;
+            let summary = onlySubtitle
+                ? `成功 ${ok}，无字幕 ${skipped}，失败 ${failed}`
+                : `成功 ${ok}，跳过 ${skipped}，失败 ${failed}`;
             if (useZip && zipEntries.length) {
-                setStatus(`正在打包 ${zipEntries.length} 个字幕…`);
-                const fileName = zipFileName(dir);
+                setStatus(`正在打包 ${zipEntries.length} 个文件…`);
+                const fileName = zipFileName(dir.split('/').filter(Boolean).pop() || '导出', selectedTypes);
                 anchorDownloadBlob(buildZip(zipEntries), fileName);
                 summary += `，已打包为 ${fileName}`;
             }
@@ -1132,6 +1929,45 @@
                 .save-actions button:disabled { color: #c0c4cc; cursor: default; }
                 .save-actions .reset-dir { color: #8c8c8c; }
                 .save-actions .reset-dir:hover:not(:disabled) { color: #666; }
+                .types {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 6px;
+                    margin-top: 10px;
+                }
+                .type-chip {
+                    height: 26px;
+                    padding: 0 10px;
+                    border: 1px solid #e5e6eb;
+                    border-radius: 13px;
+                    background: #fff;
+                    color: #5c6570;
+                    font: inherit;
+                    font-size: 12px;
+                    line-height: 24px;
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 5px;
+                    transition: background .15s, border-color .15s, color .15s;
+                }
+                .type-chip::before {
+                    content: "";
+                    width: 5px;
+                    height: 5px;
+                    border-radius: 50%;
+                    background: #c9ced6;
+                    transition: background .15s;
+                }
+                .type-chip:hover:not(:disabled) { border-color: #06a7ff; color: #06a7ff; }
+                .type-chip.active {
+                    border-color: #06a7ff;
+                    background: #eff9ff;
+                    color: #06a7ff;
+                    font-weight: 600;
+                }
+                .type-chip.active::before { background: #06a7ff; }
+                .type-chip:disabled { opacity: .55; cursor: default; }
                 .action {
                     margin-top: 14px;
                     width: 100%;
@@ -1249,9 +2085,9 @@
                 .log-item.warn { color: #d97706; }
                 .log-item.err { color: #f5222d; }
             </style>
-            <div class="panel hidden" role="dialog" aria-label="字幕下载">
+            <div class="panel hidden" role="dialog" aria-label="字幕与资料导出">
                 <div class="header">
-                    <span class="title">字幕下载</span>
+                    <span class="title">字幕与资料导出</span>
                     <button class="close" type="button" title="关闭">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
                     </button>
@@ -1268,6 +2104,12 @@
                             <button class="pick-dir" type="button">选择文件夹</button>
                             <button class="reset-dir hidden" type="button">恢复默认</button>
                         </span>
+                    </div>
+                    <div class="types" role="group" aria-label="导出内容">
+                        <button class="type-chip" data-type="subtitle" type="button" title="SRT 字幕文件">字幕</button>
+                        <button class="type-chip" data-type="transcript" type="button" title="根据字幕整理的纯文本">文稿</button>
+                        <button class="type-chip" data-type="slides" type="button" title="视频课件 PDF">课件</button>
+                        <button class="type-chip" data-type="note" type="button" title="AI 笔记 Markdown">笔记</button>
                     </div>
                     <button class="action" type="button">
                         <span class="spinner"></span>
@@ -1300,6 +2142,7 @@
         ui.savePathEl = root.querySelector('.save-path');
         ui.pickDirBtn = root.querySelector('.pick-dir');
         ui.resetDirBtn = root.querySelector('.reset-dir');
+        ui.typeChips = [...root.querySelectorAll('.type-chip')];
         ui.actionBtn = root.querySelector('.action');
         ui.actionLabel = root.querySelector('.action-label');
         ui.cancelBtn = root.querySelector('.cancel');
@@ -1309,6 +2152,9 @@
         ui.statOk = root.querySelector('.stat.ok b');
         ui.statNo = root.querySelector('.stat.warn b');
         ui.statErr = root.querySelector('.stat.err b');
+        ui.statOkLabel = root.querySelector('.stat.ok em');
+        ui.statNoLabel = root.querySelector('.stat.warn em');
+        ui.statErrLabel = root.querySelector('.stat.err em');
         ui.statusEl = root.querySelector('.status');
         ui.progressEl = root.querySelector('.progress');
         ui.progressBar = root.querySelector('.bar > i');
@@ -1316,9 +2162,12 @@
         ui.logEl = root.querySelector('.log');
 
         root.querySelector('.close').addEventListener('click', closePanel);
+        for (const chip of ui.typeChips) {
+            chip.addEventListener('click', () => toggleType(chip.dataset.type));
+        }
         ui.actionBtn.addEventListener('click', () => {
             if (!ui.context || ui.running) return;
-            if (ui.context.mode === 'video') downloadCurrentVideo();
+            if (ui.context.mode === 'video') exportCurrentVideo();
             else startBatch();
         });
         ui.cancelBtn.addEventListener('click', () => {
@@ -1337,7 +2186,9 @@
         resizeObserver.observe(ui.panel);
     }
 
+    loadTypeSelection();
     mountUI();
+    renderTypeChips();
     refreshContext();
     restoreCustomDir();
 
